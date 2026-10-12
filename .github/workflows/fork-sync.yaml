@@ -1,8 +1,8 @@
 # Fork sync
 #
 # Keeps this fork rebased on the latest uv release, runs tests, builds
-# binaries for Linux/macOS/Windows, and publishes a GitHub release.
-# Linux binaries are built the same way upstream builds its releases
+# binaries for Linux, and publishes a GitHub release. Linux binaries 
+# are built the same way upstream builds its releases
 # (manylinux2014 / glibc 2.17, PGO, static musl); see build-linux-gnu.
 #
  
@@ -295,66 +295,9 @@ jobs:
             *.sha256
           if-no-files-found: error
  
-  # macOS and Windows: plain cargo builds, packaged with upstream's archive
-  # names and checksums.
-  build-other:
-    name: Build (${{ matrix.target }})
-    needs: [sync, test]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    env:
-      TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.sync.outputs.sha }}
-          persist-credentials: false
- 
-      - uses: Swatinem/rust-cache@v2
- 
-      - name: Build
-        shell: bash
-        run: cargo build --release --locked -p uv --target "$TARGET"
- 
-      - name: Archive binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$TARGET" == *windows* ]]; then
-            ARCHIVE_FILE=uv-$TARGET.zip
-            7z a $ARCHIVE_FILE ./target/$TARGET/release/uv.exe
-            7z a $ARCHIVE_FILE ./target/$TARGET/release/uvx.exe
-            7z a $ARCHIVE_FILE ./target/$TARGET/release/uvw.exe
-            sha256sum $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
-          else
-            ARCHIVE_NAME=uv-$TARGET
-            ARCHIVE_FILE=$ARCHIVE_NAME.tar.gz
-            mkdir -p $ARCHIVE_NAME
-            cp target/$TARGET/release/uv $ARCHIVE_NAME/uv
-            cp target/$TARGET/release/uvx $ARCHIVE_NAME/uvx
-            tar czvf $ARCHIVE_FILE $ARCHIVE_NAME
-            shasum -a 256 $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
-          fi
- 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: build-github-archives-${{ matrix.target }}
-          path: |
-            *.tar.gz
-            *.zip
-            *.sha256
-          if-no-files-found: error
- 
   release:
     name: Publish release
-    needs: [sync, build-linux-gnu, build-linux-musl, build-other]
+    needs: [sync, build-linux-gnu, build-linux-musl]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -377,7 +320,7 @@ jobs:
  
   notify-failure:
     name: Report failure
-    needs: [sync, test, build-linux-gnu, build-linux-musl, build-other, release]
+    needs: [sync, test, build-linux-gnu, build-linux-musl, release]
     if: failure() && needs.sync.result == 'success'
     runs-on: ubuntu-latest
     steps:
