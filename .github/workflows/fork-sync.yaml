@@ -27,7 +27,7 @@ env:
   # Space-separated list of crates whose tests must pass before anything is
   # built or released, e.g. "uv-cli uv-resolver". Use the crates your
   # feature changes.
-  TEST_PACKAGES: "REPLACE-ME"
+  TEST_PACKAGES: "uv-resolver uv-environment-operations"
   # Build settings copied from upstream's build-release-binaries.yml.
   AWS_LC_SYS_USE_SYSTEM: "0"
   PACKAGE_NAME: uv
@@ -132,6 +132,13 @@ jobs:
           args=()
           for pkg in $TEST_PACKAGES; do args+=(-p "$pkg"); done
           cargo test --locked "${args[@]}"
+
+      - name: Run index override integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked -p uv -- python install 3.13
+          cargo test --locked -p uv --test sync index_override
  
   # ---------------------------------------------------------------------------
   # Linux builds, mirroring upstream's `linux` and `musllinux` jobs in
