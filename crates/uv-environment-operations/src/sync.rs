@@ -215,6 +215,16 @@ pub async fn sync_from_lock(
     // If necessary, convert editable to non-editable distributions.
     let resolution = apply_editable_mode(resolution, editable);
 
+    // Prefer indexes provided on the command line over the file URLs recorded in the lockfile.
+    let resolution = uv_resolver::index_override::apply_index_overrides(
+        resolution,
+        index_locations,
+        &client_builder,
+        cache,
+        concurrency,
+    )
+    .await?;
+
     // Constrain any build requirements marked as `match-runtime = true`.
     let extra_build_requires = extra_build_requires.match_runtime(&resolution)?;
 
