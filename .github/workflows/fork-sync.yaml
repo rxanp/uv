@@ -1,0 +1,390 @@
+# Fork sync
+#
+# Keeps this fork rebased on the latest uv release, runs tests, builds
+# binaries for Linux/macOS/Windows, and publishes a GitHub release.
+# Linux binaries are built the same way upstream builds its releases
+# (manylinux2014 / glibc 2.17, PGO, static musl); see build-linux-gnu.
+#
+ 
+name: Fork sync
+ 
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours
+  workflow_dispatch:
+ 
+permissions:
+  contents: write
+  issues: write
+ 
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+ 
+env:
+  UPSTREAM_URL: https://github.com/astral-sh/uv.git
+  PATCH_BRANCH: rxanp/allow-index-override-on-sync
+  # Space-separated list of crates whose tests must pass before anything is
+  # built or released, e.g. "uv-cli uv-resolver". Use the crates your
+  # feature changes.
+  TEST_PACKAGES: "REPLACE-ME"
+  # Build settings copied from upstream's build-release-binaries.yml.
+  AWS_LC_SYS_USE_SYSTEM: "0"
+  PACKAGE_NAME: uv
+  MODULE_NAME: uv
+  PYTHON_VERSION: "3.11"
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_TERM_COLOR: always
+ 
+jobs:
+  sync:
+    name: Rebase onto latest uv release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.rebase.outputs.version }}
+      tag: ${{ steps.rebase.outputs.tag }}
+      sha: ${{ steps.rebase.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+ 
+      - id: rebase
+        name: Rebase patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --tags --force --quiet
+ 
+          LATEST=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -z "$LATEST" ]; then
+            echo "::error::No upstream release tags found"; exit 1
+          fi
+          echo "Latest upstream release: $LATEST"
+ 
+          if gh release view "${LATEST}-fork" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already released ${LATEST}-fork, nothing to do."
+            exit 0
+          fi
+ 
+          OLD_BASE=$(git merge-base HEAD "$LATEST")
+          if ! git rebase --onto "$LATEST" "$OLD_BASE"; then
+            git rebase --abort
+            TITLE="Rebase onto uv ${LATEST} needs manual resolution"
+            EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --search "in:title \"$TITLE\"" --json number --jq '.[].number')
+            if [ -z "$EXISTING" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body \
+                "Rebase \`${PATCH_BRANCH}\` onto \`${LATEST}\` locally, push with \`--force-with-lease\`, then re-run this workflow from the Actions tab."
+            fi
+            echo "::error::Rebase onto ${LATEST} has conflicts"
+            exit 1
+          fi
+ 
+          git push --force-with-lease origin "HEAD:${PATCH_BRANCH}"
+          {
+            echo "version=${LATEST}"
+            echo "tag=${LATEST}-fork"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+ 
+  test:
+    name: Test (Debian)
+    needs: sync
+    if: needs.sync.outputs.sha != ''
+    runs-on: ubuntu-latest
+    # GitHub has no Debian runners, so tests run in a Debian 13 (trixie)
+    # container.
+    container: debian:trixie
+    steps:
+      - name: Check test configuration
+        if: env.TEST_PACKAGES == 'REPLACE-ME'
+        run: |
+          echo "::error::Set TEST_PACKAGES in fork-sync.yml to the crates your feature touches."
+          exit 1
+ 
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            git ca-certificates curl build-essential pkg-config
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+ 
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+ 
+      - uses: Swatinem/rust-cache@v2
+ 
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for pkg in $TEST_PACKAGES; do args+=(-p "$pkg"); done
+          cargo test --locked "${args[@]}"
+ 
+  # ---------------------------------------------------------------------------
+  # Linux builds, mirroring upstream's `linux` and `musllinux` jobs in
+  # .github/workflows/build-release-binaries.yml:
+  #   - built with maturin inside the manylinux2014 container, so the gnu
+  #     binary needs only glibc 2.17+ (CentOS 7, Debian 8+, Ubuntu 14.04+)
+  #   - profile-guided optimization (PGO) on x86_64-unknown-linux-gnu
+  #   - cargo-auditable via upstream's scripts/cargo.sh
+  #   - a fully static musl build that runs on any Linux
+  # Deliberate difference: no `--features self-update`, so `uv self update`
+  # can't replace this build with Astral's official release.
+  # Upstream's paid `depot-*` runners are replaced with GitHub-hosted ones.
+  # ---------------------------------------------------------------------------
+  build-linux-gnu:
+    name: Build (x86_64-unknown-linux-gnu)
+    needs: [sync, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120 # PGO builds uv twice plus a training run
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+ 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+ 
+      - name: Prep README.md
+        run: python scripts/transform_readme.py --target pypi
+ 
+      - name: Build (manylinux 2_17, PGO)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          sccache: false
+          maturin-version: v1.15.0
+          target: ${{ env.TARGET }}
+          container: quay.io/pypa/manylinux2014
+          manylinux: 2_17
+          docker-options: -e CARGO -e AWS_LC_SYS_USE_SYSTEM
+          args: --release --locked --out dist --compatibility pypi
+          before-script-linux: |
+            if command -v yum &> /dev/null; then
+                yum update -y && yum install -y pkgconfig libatomic
+                if [[ -f "/usr/lib/libatomic.so.1" && ! -f "/usr/lib/libatomic.so" ]]; then
+                    ln -s /usr/lib/libatomic.so.1 /usr/lib/libatomic.so
+                fi
+            else
+                apt update -y && apt-get install -y pkg-config
+            fi
+            scripts/install-cargo-extensions.sh
+ 
+            rustup component add llvm-tools-preview
+            python${{ env.PYTHON_VERSION }} scripts/build_uv_pgo.py \
+                --target "${{ env.TARGET }}" \
+                --target-dir "$PWD/target/uv-pgo" \
+                --train-only
+            export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-Cprofile-use=$PWD/target/uv-pgo/uv.profdata"
+        env:
+          CC: gcc
+          CARGO: ${{ github.workspace }}/scripts/cargo.sh
+ 
+      - name: Test wheel
+        run: |
+          pip install ${PACKAGE_NAME} --no-index --find-links dist/ --force-reinstall
+          ${MODULE_NAME} --help
+          python -m ${MODULE_NAME} --help
+          uvx --help
+ 
+      - name: Archive binary
+        shell: bash
+        run: |
+          ARCHIVE_NAME=uv-$TARGET
+          ARCHIVE_FILE=$ARCHIVE_NAME.tar.gz
+          mkdir -p $ARCHIVE_NAME
+          cp target/$TARGET/release/uv $ARCHIVE_NAME/uv
+          cp target/$TARGET/release/uvx $ARCHIVE_NAME/uvx
+          tar czvf $ARCHIVE_FILE $ARCHIVE_NAME
+          shasum -a 256 $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
+ 
+      # Not in upstream: prove the binary runs on glibc 2.17 (CentOS 7).
+      - name: Test on old glibc
+        run: |
+          docker run --rm -v "$PWD/uv-$TARGET:/uv:ro" centos:7 \
+            sh -c 'ldd --version | head -1 && /uv/uv --version && /uv/uvx --help >/dev/null'
+ 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-github-archives-${{ env.TARGET }}
+          path: |
+            *.tar.gz
+            *.sha256
+          if-no-files-found: error
+ 
+  build-linux-musl:
+    name: Build (x86_64-unknown-linux-musl)
+    needs: [sync, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+ 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+ 
+      - name: Prep README.md
+        run: python scripts/transform_readme.py --target pypi
+ 
+      - name: Build (musllinux_1_1)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          sccache: false
+          maturin-version: v1.15.0
+          target: ${{ env.TARGET }}
+          manylinux: musllinux_1_1
+          docker-options: -e CARGO -e AWS_LC_SYS_USE_SYSTEM
+          args: --release --locked --out dist --compatibility pypi
+          before-script-linux: |
+            scripts/install-cargo-extensions.sh
+        env:
+          CARGO: ${{ github.workspace }}/scripts/cargo.sh
+ 
+      - name: Archive binary
+        shell: bash
+        run: |
+          ARCHIVE_NAME=uv-$TARGET
+          ARCHIVE_FILE=$ARCHIVE_NAME.tar.gz
+          mkdir -p $ARCHIVE_NAME
+          cp target/$TARGET/release/uv $ARCHIVE_NAME/uv
+          cp target/$TARGET/release/uvx $ARCHIVE_NAME/uvx
+          tar czvf $ARCHIVE_FILE $ARCHIVE_NAME
+          shasum -a 256 $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
+ 
+      - name: Test on Alpine
+        run: |
+          docker run --rm -v "$PWD/uv-$TARGET:/uv:ro" alpine:3.12 \
+            sh -c '/uv/uv --version && /uv/uvx --help >/dev/null'
+ 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-github-archives-${{ env.TARGET }}
+          path: |
+            *.tar.gz
+            *.sha256
+          if-no-files-found: error
+ 
+  # macOS and Windows: plain cargo builds, packaged with upstream's archive
+  # names and checksums.
+  build-other:
+    name: Build (${{ matrix.target }})
+    needs: [sync, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+ 
+      - uses: Swatinem/rust-cache@v2
+ 
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p uv --target "$TARGET"
+ 
+      - name: Archive binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == *windows* ]]; then
+            ARCHIVE_FILE=uv-$TARGET.zip
+            7z a $ARCHIVE_FILE ./target/$TARGET/release/uv.exe
+            7z a $ARCHIVE_FILE ./target/$TARGET/release/uvx.exe
+            7z a $ARCHIVE_FILE ./target/$TARGET/release/uvw.exe
+            sha256sum $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
+          else
+            ARCHIVE_NAME=uv-$TARGET
+            ARCHIVE_FILE=$ARCHIVE_NAME.tar.gz
+            mkdir -p $ARCHIVE_NAME
+            cp target/$TARGET/release/uv $ARCHIVE_NAME/uv
+            cp target/$TARGET/release/uvx $ARCHIVE_NAME/uvx
+            tar czvf $ARCHIVE_FILE $ARCHIVE_NAME
+            shasum -a 256 $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
+          fi
+ 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-github-archives-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+            *.sha256
+          if-no-files-found: error
+ 
+  release:
+    name: Publish release
+    needs: [sync, build-linux-gnu, build-linux-musl, build-other]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-github-archives-*
+          merge-multiple: true
+ 
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          gh release create "$TAG" uv-* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes "uv ${VERSION} with fork patches applied. Upstream release notes: https://github.com/astral-sh/uv/releases/tag/${VERSION}"
+ 
+  notify-failure:
+    name: Report failure
+    needs: [sync, test, build-linux-gnu, build-linux-musl, build-other, release]
+    if: failure() && needs.sync.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Fork release for uv ${VERSION} failed"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number --jq '.[].number')
+          if [ -z "$EXISTING" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body \
+              "Tests, build, or release failed after rebasing onto uv ${VERSION}: ${RUN_URL}. Fix on \`${PATCH_BRANCH}\` and push; the next run will retry."
+          fi
+          
