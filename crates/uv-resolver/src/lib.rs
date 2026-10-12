@@ -44,6 +44,7 @@ mod exclusions;
 mod flat_index;
 mod fork_indexes;
 mod fork_urls;
+pub mod index_override;
 mod known_platform;
 mod manifest;
 mod marker;
