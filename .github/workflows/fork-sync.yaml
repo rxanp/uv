@@ -1,26 +1,27 @@
 # Fork sync
 #
 # Keeps this fork rebased on the latest uv release, runs tests, builds
-# binaries for Linux, and publishes a GitHub release. Linux binaries 
-# are built the same way upstream builds its releases
+# Linux binaries, and publishes a GitHub release.
+# Linux binaries are built the same way upstream builds its releases
 # (manylinux2014 / glibc 2.17, PGO, static musl); see build-linux-gnu.
 #
- 
+
 name: Fork sync
- 
+
 on:
   schedule:
     - cron: "17 */6 * * *" # every 6 hours
   workflow_dispatch:
- 
+
 permissions:
   contents: write
   issues: write
- 
+  actions: write # to disable upstream's workflows
+
 concurrency:
   group: fork-sync
   cancel-in-progress: false
- 
+
 env:
   UPSTREAM_URL: https://github.com/astral-sh/uv.git
   PATCH_BRANCH: rxanp/allow-index-override-on-sync
@@ -37,7 +38,7 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   CARGO_TERM_COLOR: always
- 
+
 jobs:
   sync:
     name: Rebase onto latest uv release
@@ -51,7 +52,12 @@ jobs:
         with:
           ref: ${{ env.PATCH_BRANCH }}
           fetch-depth: 0
- 
+          # Rebasing onto a new uv release usually changes upstream's files in
+          # .github/workflows/, and GitHub only lets a token with the
+          # "Workflows" permission push those. The built-in GITHUB_TOKEN can
+          # never have it, so the push uses this personal access token.
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+
       - id: rebase
         name: Rebase patches
         env:
@@ -62,18 +68,18 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "$UPSTREAM_URL"
           git fetch upstream --tags --force --quiet
- 
+
           LATEST=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
           if [ -z "$LATEST" ]; then
             echo "::error::No upstream release tags found"; exit 1
           fi
           echo "Latest upstream release: $LATEST"
- 
+
           if gh release view "${LATEST}-fork" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Already released ${LATEST}-fork, nothing to do."
             exit 0
           fi
- 
+
           OLD_BASE=$(git merge-base HEAD "$LATEST")
           if ! git rebase --onto "$LATEST" "$OLD_BASE"; then
             git rebase --abort
@@ -87,14 +93,34 @@ jobs:
             echo "::error::Rebase onto ${LATEST} has conflicts"
             exit 1
           fi
- 
+
           git push --force-with-lease origin "HEAD:${PATCH_BRANCH}"
           {
             echo "version=${LATEST}"
             echo "tag=${LATEST}-fork"
             echo "sha=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
- 
+
+      # Upstream's own workflows come along with every rebase, and newly added
+      # ones start out enabled. Disable everything except this workflow. Runs
+      # on every sync (including no-op runs), so a workflow GitHub registers
+      # late is caught on the next run.
+      - name: Disable upstream workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows" \
+            --jq '.workflows[]
+                  | select(.state == "active")
+                  | select(.path | startswith(".github/workflows/"))
+                  | select(.path != ".github/workflows/fork-sync.yml")
+                  | "\(.id)\t\(.path)"' |
+          while IFS=$'\t' read -r id path; do
+            echo "Disabling ${path}"
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable"
+          done
+
   test:
     name: Test (Debian)
     needs: sync
@@ -109,7 +135,7 @@ jobs:
         run: |
           echo "::error::Set TEST_PACKAGES in fork-sync.yml to the crates your feature touches."
           exit 1
- 
+
       - name: Install build dependencies
         run: |
           apt-get update -qq
@@ -118,13 +144,13 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
- 
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.sync.outputs.sha }}
- 
+
       - uses: Swatinem/rust-cache@v2
- 
+
       - name: Run tests
         shell: bash
         run: |
@@ -164,15 +190,15 @@ jobs:
         with:
           ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
- 
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
- 
+
       - name: Prep README.md
         run: python scripts/transform_readme.py --target pypi
- 
+
       - name: Build (manylinux 2_17, PGO)
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -193,7 +219,7 @@ jobs:
                 apt update -y && apt-get install -y pkg-config
             fi
             scripts/install-cargo-extensions.sh
- 
+
             rustup component add llvm-tools-preview
             python${{ env.PYTHON_VERSION }} scripts/build_uv_pgo.py \
                 --target "${{ env.TARGET }}" \
@@ -203,14 +229,14 @@ jobs:
         env:
           CC: gcc
           CARGO: ${{ github.workspace }}/scripts/cargo.sh
- 
+
       - name: Test wheel
         run: |
           pip install ${PACKAGE_NAME} --no-index --find-links dist/ --force-reinstall
           ${MODULE_NAME} --help
           python -m ${MODULE_NAME} --help
           uvx --help
- 
+
       - name: Archive binary
         shell: bash
         run: |
@@ -221,13 +247,13 @@ jobs:
           cp target/$TARGET/release/uvx $ARCHIVE_NAME/uvx
           tar czvf $ARCHIVE_FILE $ARCHIVE_NAME
           shasum -a 256 $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
- 
+
       # Not in upstream: prove the binary runs on glibc 2.17 (CentOS 7).
       - name: Test on old glibc
         run: |
           docker run --rm -v "$PWD/uv-$TARGET:/uv:ro" centos:7 \
             sh -c 'ldd --version | head -1 && /uv/uv --version && /uv/uvx --help >/dev/null'
- 
+
       - uses: actions/upload-artifact@v4
         with:
           name: build-github-archives-${{ env.TARGET }}
@@ -235,7 +261,7 @@ jobs:
             *.tar.gz
             *.sha256
           if-no-files-found: error
- 
+
   build-linux-musl:
     name: Build (x86_64-unknown-linux-musl)
     needs: [sync, test]
@@ -248,15 +274,15 @@ jobs:
         with:
           ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
- 
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: x64
- 
+
       - name: Prep README.md
         run: python scripts/transform_readme.py --target pypi
- 
+
       - name: Build (musllinux_1_1)
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -270,7 +296,7 @@ jobs:
             scripts/install-cargo-extensions.sh
         env:
           CARGO: ${{ github.workspace }}/scripts/cargo.sh
- 
+
       - name: Archive binary
         shell: bash
         run: |
@@ -281,12 +307,12 @@ jobs:
           cp target/$TARGET/release/uvx $ARCHIVE_NAME/uvx
           tar czvf $ARCHIVE_FILE $ARCHIVE_NAME
           shasum -a 256 $ARCHIVE_FILE > $ARCHIVE_FILE.sha256
- 
+
       - name: Test on Alpine
         run: |
           docker run --rm -v "$PWD/uv-$TARGET:/uv:ro" alpine:3.12 \
             sh -c '/uv/uv --version && /uv/uvx --help >/dev/null'
- 
+
       - uses: actions/upload-artifact@v4
         with:
           name: build-github-archives-${{ env.TARGET }}
@@ -294,7 +320,7 @@ jobs:
             *.tar.gz
             *.sha256
           if-no-files-found: error
- 
+
   release:
     name: Publish release
     needs: [sync, build-linux-gnu, build-linux-musl]
@@ -304,7 +330,7 @@ jobs:
         with:
           pattern: build-github-archives-*
           merge-multiple: true
- 
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -317,7 +343,7 @@ jobs:
             --target "$SHA" \
             --title "$TAG" \
             --notes "uv ${VERSION} with fork patches applied. Upstream release notes: https://github.com/astral-sh/uv/releases/tag/${VERSION}"
- 
+
   notify-failure:
     name: Report failure
     needs: [sync, test, build-linux-gnu, build-linux-musl, release]
@@ -337,4 +363,4 @@ jobs:
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body \
               "Tests, build, or release failed after rebasing onto uv ${VERSION}: ${RUN_URL}. Fix on \`${PATCH_BRANCH}\` and push; the next run will retry."
           fi
-          
+
