@@ -31,8 +31,9 @@ use uv_client::{
 use uv_configuration::{Concurrency, IndexStrategy};
 use uv_distribution_filename::DistFilename;
 use uv_distribution_types::{
-    BuiltDist, Dist, File, Index, IndexCapabilities, IndexLocations, IndexMetadataRef, IndexUrl,
-    Origin, RegistryBuiltWheel, RegistrySourceDist, Resolution, ResolvedDist, SourceDist,
+    BuiltDist, Dist, File, Index, IndexCapabilities, IndexEntryFilename, IndexLocations,
+    IndexMetadataRef, IndexUrl, Origin, RegistryBuiltWheel, RegistrySourceDist, Resolution,
+    ResolvedDist, SourceDist,
 };
 use uv_normalize::PackageName;
 use uv_pypi_types::HashDigests;
@@ -314,7 +315,10 @@ async fn find_replacements(
                 MetadataFormat::Flat(entries) => {
                     for entry in entries {
                         let (filename, file, _) = entry.into_parts();
-                        listed.push((filename, file));
+                        // Variant metadata files aren't installable, so they can't match.
+                        if let IndexEntryFilename::DistFilename(filename) = filename {
+                            listed.push((filename, file));
+                        }
                     }
                 }
             }
