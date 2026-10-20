@@ -110,13 +110,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Path of this workflow file, whatever it is named. GITHUB_WORKFLOW_REF
+          # looks like "owner/repo/.github/workflows/<file>@refs/heads/<branch>".
+          SELF="${GITHUB_WORKFLOW_REF#"${GITHUB_REPOSITORY}/"}"
+          SELF="${SELF%%@*}"
+          echo "Keeping ${SELF} enabled"
+          case "$SELF" in
+            .github/workflows/*) ;;
+            *) echo "::error::Could not determine this workflow's path (${GITHUB_WORKFLOW_REF}); not disabling anything"; exit 1 ;;
+          esac
+ 
           gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows" \
             --jq '.workflows[]
                   | select(.state == "active")
                   | select(.path | startswith(".github/workflows/"))
-                  | select(.path != ".github/workflows/fork-sync.yml")
                   | "\(.id)\t\(.path)"' |
           while IFS=$'\t' read -r id path; do
+            [ "$path" = "$SELF" ] && continue
             echo "Disabling ${path}"
             gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable"
           done
